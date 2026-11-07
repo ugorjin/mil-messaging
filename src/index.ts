@@ -8,3 +8,6 @@ export * from './layer1.ts';
 export * from './layer2.ts';
 export * from './relay.ts';
 export * from './token.ts';
+export * from './http-relay.ts';
+export * from './request-auth.ts';
+export * from './remote-trust.ts';

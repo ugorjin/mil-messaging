@@ -1,0 +1,10 @@
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy relay:8080
+	header {
+		-Server
+	}
+	log {
+		output discard
+	}
+}

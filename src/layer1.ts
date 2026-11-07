@@ -94,7 +94,7 @@ export type FetchedPreKeys = Omit<PublicPreKeys, 'oneTimePreKeys'> & { oneTimePr
 // ------------------------------------------------------------- Key stores
 
 /** Looks up the identity key the Authority certified for a user ID (aci). */
-export type ExpectedIdentity = (aci: string) => PublicKey | undefined;
+export type ExpectedIdentity = (aci: string) => Promise<PublicKey | undefined>;
 
 class Identities extends IdentityKeyStore {
   #pair: IdentityKeyPair;
@@ -121,7 +121,7 @@ class Identities extends IdentityKeyStore {
   }
   /** Fail closed: only the key in the Authority-signed enrollment certificate is trusted. */
   async isTrustedIdentity(name: ProtocolAddress, key: PublicKey, _direction: Direction): Promise<boolean> {
-    const expected = this.#expected(name.name());
+    const expected = await this.#expected(name.name());
     return expected !== undefined && expected.equals(key);
   }
   async getIdentity(name: ProtocolAddress): Promise<PublicKey | null> {
@@ -200,6 +200,7 @@ export class SignalEndpoint {
   readonly aci: string;
   readonly address: ProtocolAddress;
   readonly identityKey: PublicKey;
+  #identityPrivate: PrivateKey;
   #identities: Identities;
   #sessions = new Sessions();
   #preKeys = new PreKeys();
@@ -211,6 +212,7 @@ export class SignalEndpoint {
     this.aci = aci;
     this.address = ProtocolAddress.new(aci, DEVICE_ID);
     this.identityKey = pair.publicKey;
+    this.#identityPrivate = pair.privateKey;
     this.#identities = new Identities(pair, registrationId, expected);
     this.#public = pub;
   }
@@ -242,6 +244,11 @@ export class SignalEndpoint {
     return ep;
   }
 
+  /** Sign with the identity key (used to authenticate requests to the relay). */
+  sign(data: Uint8Array): Uint8Array {
+    return this.#identityPrivate.sign(Uint8Array.from(data));
+  }
+
   publicPreKeys(): PublicPreKeys {
     return structuredClone(this.#public);
   }
@@ -259,12 +266,12 @@ export class SignalEndpoint {
     recipientAci: string,
     plaintext: Uint8Array,
     senderCert: SenderCertificate,
-    fetchPreKeys: () => FetchedPreKeys,
+    fetchPreKeys: () => Promise<FetchedPreKeys>,
     now: number,
   ): Promise<string> {
     const addr = ProtocolAddress.new(recipientAci, DEVICE_ID);
     if (!(await this.hasSession(recipientAci))) {
-      const p = fetchPreKeys();
+      const p = await fetchPreKeys();
       const bundle = PreKeyBundle.new(
         p.registrationId,
         p.deviceId,

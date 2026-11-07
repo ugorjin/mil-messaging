@@ -1,0 +1,11 @@
+# Never send keys or local config into the build context.
+*.secret.json
+.env
+.env.*
+.git
+node_modules
+test
+*.md
+Dockerfile
+docker-compose.yml
+Caddyfile

@@ -26,6 +26,6 @@ export async function enroll(authority: Authority, o: ClientOptions & EnrollOpti
   const clearance = o.clearance
     ? authority.issueClearance(client.userId, o.clearance, token.generateClearanceKey(), validMs)
     : undefined;
-  client.installCertificates(enrollment, authority.issueSenderCertificate(enrollment), clearance);
+  await client.installCertificates(enrollment, authority.issueSenderCertificate(enrollment), clearance);
   return { client, token };
 }

@@ -39,12 +39,12 @@ test('two-way conversation keeps working as the Double Ratchet advances', async 
 test('one-time pre-keys are used once each', async () => {
   const w = world();
   const bob = await w.user('bob');
-  const before = w.relay.lookup('bob')!.preKeys.oneTimePreKeys.length;
+  const before = w.relay.lookupSync('bob')!.preKeys.oneTimePreKeys.length;
   for (const name of ['alice', 'carol', 'dave']) {
     const u = await w.user(name);
     await u.client.sendText('bob', `hi from ${name}`);
   }
-  assert.equal(w.relay.lookup('bob')!.preKeys.oneTimePreKeys.length, before - 3);
+  assert.equal(w.relay.lookupSync('bob')!.preKeys.oneTimePreKeys.length, before - 3);
   assert.equal((await bob.client.sync()).length, 3);
 });
 
@@ -66,7 +66,7 @@ test('server swapping in its own identity key (MITM) is refused', async () => {
   await w.user('bob');
   await w.user('fake-bob');
   // A malicious server hands out fake-bob's pre-keys under bob's name.
-  w.relay.publish('bob', { ...w.relay.lookup('bob')!, preKeys: w.relay.lookup('fake-bob')!.preKeys });
+  await w.relay.publish('bob', { ...w.relay.lookupSync('bob')!, preKeys: w.relay.lookupSync('fake-bob')!.preKeys });
   await assert.rejects(alice.client.sendText('bob', 'hi'), /untrusted identity/i);
   assert.equal(w.relay.stored().length, 0);
 });
@@ -102,11 +102,22 @@ test('replayed envelopes are rejected by the ratchet', async () => {
   const alice = await w.user('alice');
   const bob = await w.user('bob');
   await alice.client.sendText('bob', 'once');
-  const [env] = w.relay.fetch('bob');
-  w.relay.deliver(env);
-  w.relay.deliver(env);
+  const [env] = w.relay.stored();
   assert.equal((await bob.client.sync()).length, 1);
+  assert.equal(w.relay.stored().length, 0, 'acknowledged messages are removed');
+  // An attacker who recorded the envelope delivers it again.
+  await w.relay.deliver(env);
+  assert.equal((await bob.client.sync()).length, 0);
   assert.equal(rejections(w).length, 1);
+});
+
+test('messages stay queued until the client acknowledges them', async () => {
+  const w = world();
+  const alice = await w.user('alice');
+  await w.user('bob');
+  await alice.client.sendText('bob', 'm1');
+  await w.relay.fetch('bob'); // e.g. the client crashed before processing
+  assert.equal(w.relay.stored().length, 1);
 });
 
 test('revoked enrollment: no new sender certificate, and messages to/from them are refused', async () => {
@@ -226,7 +237,7 @@ test('revoked clearance blocks both sending and opening', async () => {
   const bob = await w.user('bob', ops('SECRET'));
   const id = await alice.client.sendClassified('bob', 'before revocation', { level: 'SECRET' });
   await bob.client.sync();
-  w.authority.revoke(w.relay.lookup('bob')!.clearance!.body.serial, 'clearance suspended');
+  w.authority.revoke(w.relay.lookupSync('bob')!.clearance!.body.serial, 'clearance suspended');
   assert.throws(() => bob.client.openClassified(id, bob.token, PIN), /revoked/);
   await assert.rejects(alice.client.sendClassified('bob', 'after', { level: 'SECRET' }), /revoked/);
 });

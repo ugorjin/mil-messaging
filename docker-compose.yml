@@ -1,0 +1,71 @@
+# Relay server + Postgres. Optional HTTPS front end with: docker compose --profile tls up
+#
+# Before the first run:
+#   cp .env.example .env
+#   npm run authority -- init        # paste AUTHORITY_PUBLIC_KEY into .env
+#   set POSTGRES_PASSWORD in .env
+name: mil-messaging
+
+services:
+  db:
+    image: postgres:16.10-bookworm
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_DB: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  relay:
+    build: .
+    image: mil-messaging-relay:latest
+    environment:
+      AUTHORITY_PUBLIC_KEY: ${AUTHORITY_PUBLIC_KEY:?run "npm run authority -- init" and set AUTHORITY_PUBLIC_KEY in .env}
+      DATABASE_URL: postgres://relay:${POSTGRES_PASSWORD}@db:5432/relay
+      MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-30}
+      # The port below is only reachable from this machine and from the Caddy proxy.
+      TRUST_PROXY: "true"
+    ports:
+      # Localhost only. Put TLS in front (the "tls" profile below, or your own load balancer).
+      - "127.0.0.1:${RELAY_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend, frontend]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # Automatic HTTPS (Let's Encrypt) for a public DNS name. Needs ports 80/443 open.
+  caddy:
+    profiles: [tls]
+    image: caddy:2.10-alpine
+    environment:
+      # Your public DNS name. "localhost" uses a self-signed local certificate.
+      DOMAIN: ${DOMAIN:-localhost}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [relay]
+    networks: [frontend]
+    restart: unless-stopped
+
+networks:
+  backend:
+    internal: true   # the database has no route to the outside
+  frontend: {}
+
+volumes:
+  pgdata: {}
+  caddy_data: {}

@@ -9,14 +9,21 @@
   },
   "scripts": {
     "demo": "node src/demo.ts",
+    "net-demo": "node src/net-demo.ts",
+    "authority": "node src/tools/authority.ts",
+    "server": "node src/server/main.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
+    "@types/ws": "^8.18.2",
     "typescript": "^5.8.0"
   },
   "dependencies": {
-    "@signalapp/libsignal-client": "^0.106.2"
+    "@signalapp/libsignal-client": "^0.106.2",
+    "pg": "^8.23.1",
+    "ws": "^8.22.1"
   }
 }

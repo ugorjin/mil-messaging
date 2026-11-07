@@ -22,14 +22,14 @@ import { canonical, randomId } from './crypto.ts';
 import { deviceViolations, type DeviceState } from './device.ts';
 import { decodePublicKey, encodePublicKey, SignalEndpoint, type Inner } from './layer1.ts';
 import { openClassified, sealClassified, type ClassifiedHeader, type HandlingPolicy } from './layer2.ts';
-import type { RelayServer } from './relay.ts';
+import type { Relay } from './relay.ts';
 import type { HardwareToken } from './token.ts';
 
 export class AccessDenied extends Error {}
 
 export interface ClientOptions {
   userId: string;
-  relay: RelayServer;
+  relay: Relay;
   trust: TrustAnchor;
   audit: AuditLog;
   device: DeviceState;
@@ -61,7 +61,7 @@ export interface ClassifiedView {
 export class Client {
   readonly userId: string;
   device: DeviceState;
-  #relay: RelayServer;
+  #relay: Relay;
   #trust: TrustAnchor;
   #trustRoot: PublicKey;
   #audit: AuditLog;
@@ -90,8 +90,9 @@ export class Client {
   /** Create a client and generate its Signal identity and pre-keys. */
   static async create(o: ClientOptions): Promise<Client> {
     let self: Client | undefined;
-    const signal = await SignalEndpoint.create(randomUUID(), (aci) => (self ? self.#certifiedIdentity(aci) : undefined));
+    const signal = await SignalEndpoint.create(randomUUID(), async (aci) => (self ? self.#certifiedIdentity(aci) : undefined));
     self = new Client(o, signal);
+    o.relay.bindIdentity?.({ userId: o.userId, sign: (data) => signal.sign(data) });
     return self;
   }
 
@@ -104,7 +105,7 @@ export class Client {
   }
 
   /** Install certificates from the authority and publish the public bundle. */
-  installCertificates(enrollment: Signed<EnrollmentCert>, senderCert: SenderCertificate, clearance?: Signed<ClearanceCert>): void {
+  async installCertificates(enrollment: Signed<EnrollmentCert>, senderCert: SenderCertificate, clearance?: Signed<ClearanceCert>): Promise<void> {
     const e = verifyCert(this.#trust, enrollment, 'enrollment', this.#now());
     if (e.userId !== this.userId || e.aci !== this.aci || e.signalIdentityKey !== this.signalIdentityKey) {
       throw new Error('enrollment certificate does not match this client');
@@ -113,7 +114,7 @@ export class Client {
     this.#enrollment = enrollment;
     this.#clearance = clearance;
     this.installSenderCertificate(senderCert);
-    this.#relay.publish(this.userId, { enrollment, clearance, preKeys: this.#signal.publicPreKeys() });
+    await this.#relay.publish(this.userId, { enrollment, clearance, preKeys: this.#signal.publicPreKeys() });
   }
 
   /** Sender certificates are short-lived; the app fetches a new one before it expires. */
@@ -149,7 +150,7 @@ export class Client {
 
     let recipient: ClearanceCert;
     try {
-      recipient = this.#peerClearance(to);
+      recipient = await this.#peerClearance(to);
     } catch (err) {
       refuse((err as Error).message);
     }
@@ -183,7 +184,7 @@ export class Client {
   async #send(inner: Inner): Promise<string> {
     if (!this.#enrollment || !this.#senderCert) throw new Error('client not enrolled');
     if (this.#senderCert.expiration() <= this.#now()) throw new Error('sender certificate expired; fetch a new one from the authority');
-    const peer = this.#peerEnrollment(inner.to);
+    const peer = await this.#peerEnrollment(inner.to);
     const sealed = await this.#signal.encrypt(
       peer.aci,
       canonical(inner),
@@ -191,7 +192,7 @@ export class Client {
       () => this.#relay.takePreKeys(inner.to),
       this.#now(),
     );
-    this.#relay.deliver({ v: 1, id: inner.msgId, to: inner.to, sealed });
+    await this.#relay.deliver({ v: 1, id: inner.msgId, to: inner.to, sealed });
     return inner.msgId;
   }
 
@@ -200,12 +201,13 @@ export class Client {
   /** Fetch new messages. Invalid ones are dropped and logged. */
   async sync(): Promise<ReceivedMessage[]> {
     const out: ReceivedMessage[] = [];
-    for (const env of this.#relay.fetch(this.userId)) {
+    const envelopes = await this.#relay.fetch(this.userId);
+    for (const env of envelopes) {
       let inner: Inner;
       try {
         const { senderAci, plaintext } = await this.#signal.decrypt(env.sealed, this.#trustRoot, this.#now());
         inner = JSON.parse(plaintext.toString('utf8')) as Inner;
-        this.#checkInner(inner, env.id, senderAci);
+        await this.#checkInner(inner, env.id, senderAci);
       } catch (err) {
         this.#log({ event: 'REJECTED_MESSAGE', msgId: env.id, detail: (err as Error).message });
         continue;
@@ -222,13 +224,15 @@ export class Client {
         out.push({ kind: 'classified', msgId: h.msgId, from: h.from, sentAt: inner.sentAt, label: formatLabel(h), policy: h.policy });
       }
     }
+    // Acknowledge only after processing, so a crash mid-sync doesn't lose messages.
+    if (envelopes.length) await this.#relay.ack(this.userId, envelopes.map((e) => e.id));
     return out;
   }
 
   /** libsignal has proved which account sent it; check that matches who the message claims to be from. */
-  #checkInner(inner: Inner, envelopeId: string, senderAci: string): void {
+  async #checkInner(inner: Inner, envelopeId: string, senderAci: string): Promise<void> {
     if (inner.to !== this.userId || inner.msgId !== envelopeId) throw new Error('envelope/addressing mismatch');
-    const sender = this.#peerEnrollment(inner.from);
+    const sender = await this.#peerEnrollment(inner.from);
     if (sender.aci !== senderAci) throw new Error(`sender mismatch: message claims to be from ${inner.from}`);
     if (inner.kind === 'classified') {
       const h = inner.classified.header;
@@ -314,8 +318,8 @@ export class Client {
   // ------------------------------------------------------------- Helpers
 
   /** The identity key the authority certified for a Signal account, if still valid. */
-  #certifiedIdentity(aci: string): PublicKey | undefined {
-    const b = this.#relay.findByAci(aci);
+  async #certifiedIdentity(aci: string): Promise<PublicKey | undefined> {
+    const b = await this.#relay.findByAci(aci);
     if (!b) return undefined;
     try {
       const e = verifyCert(this.#trust, b.enrollment, 'enrollment', this.#now());
@@ -330,16 +334,16 @@ export class Client {
     return verifyCert(this.#trust, this.#clearance, 'clearance', this.#now());
   }
 
-  #peerEnrollment(userId: string): EnrollmentCert {
-    const b = this.#relay.lookup(userId);
+  async #peerEnrollment(userId: string): Promise<EnrollmentCert> {
+    const b = await this.#relay.lookup(userId);
     if (!b) throw new Error(`unknown user ${userId}`);
     const e = verifyCert(this.#trust, b.enrollment, 'enrollment', this.#now());
     if (e.userId !== userId) throw new Error(`certificate for ${e.userId} published as ${userId}`);
     return e;
   }
 
-  #peerClearance(userId: string): ClearanceCert {
-    const b = this.#relay.lookup(userId);
+  async #peerClearance(userId: string): Promise<ClearanceCert> {
+    const b = await this.#relay.lookup(userId);
     if (!b?.clearance) throw new AccessDenied(`${userId} holds no clearance`);
     let c: ClearanceCert;
     try {

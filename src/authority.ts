@@ -17,6 +17,7 @@ import { PrivateKey, PublicKey, ServerCertificate, SenderCertificate } from '@si
 import { formatLabel, type Label, type Level } from './classification.ts';
 import { AuditLog } from './audit.ts';
 import { DEVICE_ID } from './layer1.ts';
+import { createPrivateKey, createPublicKey } from 'node:crypto';
 import { canonical, exportPub, newEd25519, randomId, signData, verifyData } from './crypto.ts';
 
 export interface EnrollmentCert {
@@ -35,6 +36,14 @@ export interface ClearanceCert {
   level: Level;
   compartments: string[];
   clearancePub: string;
+  notAfter: number;
+}
+
+export interface Revocation {
+  kind: 'revocation';
+  serial: string;
+  revokedAt: number;
+  reason: string;
   notAfter: number;
 }
 
@@ -61,11 +70,21 @@ export class Authority implements TrustAnchor {
   #trustRoot = PrivateKey.generate();
   #serverKey = PrivateKey.generate();
   #serverCert = ServerCertificate.new(1, this.#serverKey.getPublicKey(), this.#trustRoot);
-  #revoked = new Set<string>();
+  #revoked = new Map<string, Signed<Revocation>>();
   #now: () => number;
 
-  constructor(opts: { now?: () => number } = {}) {
+  constructor(opts: { now?: () => number; secrets?: string } = {}) {
     this.#now = opts.now ?? Date.now;
+    if (opts.secrets) {
+      const k = JSON.parse(opts.secrets) as { signingKey: string; trustRoot: string; serverKey: string };
+      this.#signingKey = {
+        privateKey: createPrivateKey(k.signingKey),
+        publicKey: createPublicKey(createPrivateKey(k.signingKey)),
+      };
+      this.#trustRoot = PrivateKey.deserialize(Buffer.from(k.trustRoot, 'base64'));
+      this.#serverKey = PrivateKey.deserialize(Buffer.from(k.serverKey, 'base64'));
+      this.#serverCert = ServerCertificate.new(1, this.#serverKey.getPublicKey(), this.#trustRoot);
+    }
     this.publicKey = exportPub(this.#signingKey.publicKey);
     this.sealedSenderTrustRoot = Buffer.from(this.#trustRoot.getPublicKey().serialize()).toString('base64');
   }
@@ -118,13 +137,33 @@ export class Authority implements TrustAnchor {
     return SenderCertificate.new(e.aci, null, DEVICE_ID, identity, this.#now() + validMs, this.#serverCert, this.#serverKey);
   }
 
-  revoke(serial: string, reason = 'unspecified'): void {
-    this.#revoked.add(serial);
+  /** Revoke a certificate. Returns a signed revocation to publish to the relay. */
+  revoke(serial: string, reason = 'unspecified'): Signed<Revocation> {
+    // Kept until well after any certificate could still be valid.
+    const rev = this.#sign<Revocation>({ kind: 'revocation', serial, revokedAt: this.#now(), reason, notAfter: this.#now() + 10 * 365 * 86_400_000 });
+    this.#revoked.set(serial, rev);
     this.audit.append({ ts: this.#now(), actor: 'authority', event: 'CERT_REVOKED', detail: `${serial}: ${reason}` });
+    return rev;
   }
 
   isRevoked(serial: string): boolean {
     return this.#revoked.has(serial);
+  }
+
+  revocations(): Signed<Revocation>[] {
+    return [...this.#revoked.values()];
+  }
+
+  /**
+   * The authority's private keys, for saving to a protected file. In
+   * production these never leave an HSM.
+   */
+  exportSecrets(): string {
+    return JSON.stringify({
+      signingKey: this.#signingKey.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+      trustRoot: Buffer.from(this.#trustRoot.serialize()).toString('base64'),
+      serverKey: Buffer.from(this.#serverKey.serialize()).toString('base64'),
+    });
   }
 }
 
@@ -140,4 +179,11 @@ export function verifyCert<T extends { serial: string; notAfter: number; kind: s
   if (now > cert.body.notAfter) throw new CertificateError('certificate expired');
   if (trust.isRevoked(cert.body.serial)) throw new CertificateError('certificate revoked');
   return cert.body;
+}
+
+/** Check a revocation's signature. Returns its body or throws. */
+export function verifyRevocation(authorityPublicKey: string, rev: Signed<Revocation>): Revocation {
+  if (rev?.body?.kind !== 'revocation' || typeof rev.body.serial !== 'string') throw new CertificateError('not a revocation');
+  if (!verifyData(authorityPublicKey, canonical(rev.body), rev.sig)) throw new CertificateError('bad revocation signature');
+  return rev.body;
 }

@@ -69,7 +69,7 @@ await attempt('bob opens it again', () => bob.client.openClassified(once, bob.to
 step('Revocation: clearance suspended');
 const later = await alice.client.sendClassified('bob', 'New grid reference.', { level: 'SECRET' });
 await bob.client.sync();
-authority.revoke(relay.lookup('bob')!.clearance!.body.serial, 'clearance suspended pending review');
+authority.revoke(relay.lookupSync('bob')!.clearance!.body.serial, 'clearance suspended pending review');
 await attempt('bob opens after revocation', () => bob.client.openClassified(later, bob.token, PIN));
 await attempt('alice sends to bob after revocation', () => alice.client.sendClassified('bob', 'x', { level: 'SECRET' }));
 
