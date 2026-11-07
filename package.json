@@ -1,0 +1,17 @@
+{
+  "name": "mil-messaging",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prototype of a two-layer encrypted messenger with clearance-gated classified messages",
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "demo": "node src/demo.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.0"
+  }
+}
