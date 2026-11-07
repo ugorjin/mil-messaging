@@ -1,7 +1,8 @@
 /**
  * The relay server (stand-in for a self-hosted message server).
  *
- * It holds public key bundles and queues encrypted envelopes per recipient. It
+ * It holds public key bundles (certificates and Signal pre-keys) and queues
+ * sealed-sender envelopes per recipient. It
  * never holds a private key, so it cannot read messages; it does not even learn
  * who sent a message (sealed sender).
  *
@@ -10,11 +11,12 @@
  * fetch, padding to fixed size buckets, and on-premises / air-gapped hosting.
  */
 import type { ClearanceCert, EnrollmentCert, Signed } from './authority.ts';
-import type { TransportEnvelope } from './layers.ts';
+import type { FetchedPreKeys, PublicPreKeys, TransportEnvelope } from './layer1.ts';
 
 export interface PublicBundle {
   enrollment: Signed<EnrollmentCert>;
   clearance?: Signed<ClearanceCert>;
+  preKeys: PublicPreKeys;
 }
 
 export class RelayServer {
@@ -27,6 +29,20 @@ export class RelayServer {
 
   lookup(userId: string): PublicBundle | undefined {
     return this.#bundles.get(userId);
+  }
+
+  /** Find a user by Signal account ID. Untrusted: callers verify the certificate. */
+  findByAci(aci: string): PublicBundle | undefined {
+    for (const b of this.#bundles.values()) if (b.enrollment.body.aci === aci) return b;
+    return undefined;
+  }
+
+  /** Hand out a pre-key bundle with at most one one-time pre-key, which is then removed. */
+  takePreKeys(userId: string): FetchedPreKeys {
+    const b = this.#bundles.get(userId);
+    if (!b) throw new Error(`unknown user ${userId}`);
+    const { oneTimePreKeys, ...rest } = b.preKeys;
+    return structuredClone({ ...rest, oneTimePreKey: oneTimePreKeys.shift() });
   }
 
   deliver(env: TransportEnvelope): void {

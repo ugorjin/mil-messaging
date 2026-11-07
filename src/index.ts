@@ -4,6 +4,7 @@ export * from './classification.ts';
 export * from './client.ts';
 export * from './device.ts';
 export * from './enroll.ts';
-export * from './layers.ts';
+export * from './layer1.ts';
+export * from './layer2.ts';
 export * from './relay.ts';
 export * from './token.ts';

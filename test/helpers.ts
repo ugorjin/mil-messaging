@@ -1,4 +1,4 @@
-import { Authority, Client, enroll, RelayServer, type DeviceState, type Label } from '../src/index.ts';
+import { Authority, enroll, RelayServer, type DeviceState, type Label } from '../src/index.ts';
 
 export const PIN = '482913';
 
@@ -19,11 +19,18 @@ export function world() {
   const authority = new Authority({ now });
   const relay = new RelayServer();
 
-  const user = (userId: string, clearance?: Label, validDays?: number) => {
-    const client = new Client({ userId, relay, trust: authority, audit: authority.audit, device: goodDevice(`${userId}-phone`, now()), now });
-    const token = enroll(authority, client, { pin: PIN, clearance, validDays });
-    return { client, token };
-  };
+  const user = (userId: string, clearance?: Label, validDays?: number, issuer: Authority = authority) =>
+    enroll(issuer, {
+      userId,
+      relay,
+      trust: issuer,
+      audit: issuer.audit,
+      device: goodDevice(`${userId}-phone`, now()),
+      now,
+      pin: PIN,
+      clearance,
+      validDays,
+    });
 
-  return { clock, authority, relay, user };
+  return { clock, now, authority, relay, user };
 }

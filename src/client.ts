@@ -2,32 +2,26 @@
  * A messaging client (one per user device).
  *
  * Sending a classified message (fails closed: any check failing aborts the send):
- *   1. the sender's own clearance must cover the label (no "write up" you can't read);
+ *   1. the sender's own clearance must cover the label (you can't send what you can't read);
  *   2. the recipient's clearance cert must be validly signed, unexpired, unrevoked
  *      and cover the label;
- *   3. layer 2: encrypt to the recipient's clearance key; layer 1: encrypt to their
- *      transport key; sign with the sender's identity key.
+ *   3. layer 2: encrypt to the recipient's clearance key;
+ *      layer 1: send inside the Signal session, with sealed sender.
  *
  * Opening a classified message (each failure is denied and written to the audit log):
  *   handling rules (view-once, expiry) → device posture → own clearance still
  *   valid and covering the label → hardware token present + correct PIN →
  *   decrypt → watermark the view.
  */
-import type { AuditLog } from './audit.ts';
+import { PublicKey, type SenderCertificate } from '@signalapp/libsignal-client';
+import { randomUUID } from 'node:crypto';
+import type { AuditLog, AuditRecord } from './audit.ts';
 import { verifyCert, type ClearanceCert, type EnrollmentCert, type Signed, type TrustAnchor } from './authority.ts';
 import { dominates, formatLabel, isLevel, LEVELS, type Label } from './classification.ts';
-import { canonical, exportPub, newEd25519, newX25519, randomId, signData, verifyData } from './crypto.ts';
+import { canonical, randomId } from './crypto.ts';
 import { deviceViolations, type DeviceState } from './device.ts';
-import {
-  openClassified,
-  openTransport,
-  sealClassified,
-  sealTransport,
-  type ClassifiedHeader,
-  type HandlingPolicy,
-  type Inner,
-  type InnerUnsigned,
-} from './layers.ts';
+import { decodePublicKey, encodePublicKey, SignalEndpoint, type Inner } from './layer1.ts';
+import { openClassified, sealClassified, type ClassifiedHeader, type HandlingPolicy } from './layer2.ts';
 import type { RelayServer } from './relay.ts';
 import type { HardwareToken } from './token.ts';
 
@@ -66,68 +60,100 @@ export interface ClassifiedView {
 
 export class Client {
   readonly userId: string;
+  device: DeviceState;
   #relay: RelayServer;
   #trust: TrustAnchor;
+  #trustRoot: PublicKey;
   #audit: AuditLog;
   #now: () => number;
-  device: DeviceState;
 
-  #identity = newEd25519();
-  #transport = newX25519();
+  #signal: SignalEndpoint;
   #enrollment: Signed<EnrollmentCert> | undefined;
   #clearance: Signed<ClearanceCert> | undefined;
+  #senderCert: SenderCertificate | undefined;
 
   #inbox = new Map<string, Inner>();
   #seen = new Set<string>();
   #consumed = new Set<string>();
 
-  constructor(o: ClientOptions) {
+  private constructor(o: ClientOptions, signal: SignalEndpoint) {
     this.userId = o.userId;
+    this.device = o.device;
     this.#relay = o.relay;
     this.#trust = o.trust;
+    this.#trustRoot = decodePublicKey(o.trust.sealedSenderTrustRoot);
     this.#audit = o.audit;
-    this.device = o.device;
     this.#now = o.now ?? Date.now;
+    this.#signal = signal;
   }
 
-  get identityPub(): string {
-    return exportPub(this.#identity.publicKey);
+  /** Create a client and generate its Signal identity and pre-keys. */
+  static async create(o: ClientOptions): Promise<Client> {
+    let self: Client | undefined;
+    const signal = await SignalEndpoint.create(randomUUID(), (aci) => (self ? self.#certifiedIdentity(aci) : undefined));
+    self = new Client(o, signal);
+    return self;
   }
 
-  get transportPub(): string {
-    return exportPub(this.#transport.publicKey);
+  get aci(): string {
+    return this.#signal.aci;
+  }
+
+  get signalIdentityKey(): string {
+    return encodePublicKey(this.#signal.identityKey);
   }
 
   /** Install certificates from the authority and publish the public bundle. */
-  installCertificates(enrollment: Signed<EnrollmentCert>, clearance?: Signed<ClearanceCert>): void {
+  installCertificates(enrollment: Signed<EnrollmentCert>, senderCert: SenderCertificate, clearance?: Signed<ClearanceCert>): void {
     const e = verifyCert(this.#trust, enrollment, 'enrollment', this.#now());
-    if (e.userId !== this.userId || e.identityPub !== this.identityPub || e.transportPub !== this.transportPub) {
+    if (e.userId !== this.userId || e.aci !== this.aci || e.signalIdentityKey !== this.signalIdentityKey) {
       throw new Error('enrollment certificate does not match this client');
     }
     if (clearance && clearance.body.userId !== this.userId) throw new Error('clearance certificate is for another user');
     this.#enrollment = enrollment;
     this.#clearance = clearance;
-    this.#relay.publish(this.userId, { enrollment, clearance });
+    this.installSenderCertificate(senderCert);
+    this.#relay.publish(this.userId, { enrollment, clearance, preKeys: this.#signal.publicPreKeys() });
+  }
+
+  /** Sender certificates are short-lived; the app fetches a new one before it expires. */
+  installSenderCertificate(cert: SenderCertificate): void {
+    if (cert.senderUuid() !== this.aci) throw new Error('sender certificate is for another account');
+    this.#senderCert = cert;
+  }
+
+  get enrollment(): Signed<EnrollmentCert> | undefined {
+    return this.#enrollment;
   }
 
   // ------------------------------------------------------------- Sending
 
-  sendText(to: string, body: string): string {
+  sendText(to: string, body: string): Promise<string> {
     return this.#send({ kind: 'plain', ...this.#base(to), body });
   }
 
-  sendClassified(to: string, text: string, o: SendClassifiedOptions): string {
+  async sendClassified(to: string, text: string, o: SendClassifiedOptions): Promise<string> {
     if (!isLevel(o.level) || o.level === 'UNCLASSIFIED') throw new Error(`classified level must be one of ${LEVELS.slice(1).join(', ')}`);
     const label: Label = { level: o.level, compartments: [...new Set(o.compartments ?? [])].sort() };
+    const labelText = formatLabel(label);
     const now = this.#now();
+    const refuse: (reason: string) => never = (reason) => this.#deny(undefined, labelText, `send to ${to} refused: ${reason}`);
 
-    const own = this.#ownClearance();
-    if (!dominates(own, label)) throw new AccessDenied(`your clearance (${formatLabel(own)}) does not cover ${formatLabel(label)}`);
-
-    const recipient = this.#peerClearance(to);
-    if (!dominates(recipient, label)) {
-      throw new AccessDenied(`${to}'s clearance (${formatLabel(recipient)}) does not cover ${formatLabel(label)}`);
+    let own: ClearanceCert;
+    try {
+      own = this.#ownClearance();
+    } catch (err) {
+      refuse((err as Error).message);
     }
+    if (!dominates(own, label)) refuse(`your clearance (${formatLabel(own)}) does not cover ${labelText}`);
+
+    let recipient: ClearanceCert;
+    try {
+      recipient = this.#peerClearance(to);
+    } catch (err) {
+      refuse((err as Error).message);
+    }
+    if (!dominates(recipient, label)) refuse(`${to}'s clearance (${formatLabel(recipient)}) does not cover ${labelText}`);
 
     const base = this.#base(to);
     const header: ClassifiedHeader = {
@@ -145,34 +171,43 @@ export class Client {
       createdAt: now,
     };
     const classified = sealClassified(header, text, recipient.clearancePub);
-    this.#log('SENT_CLASSIFIED', base.msgId, formatLabel(label), `to ${to}`);
-    return this.#send({ kind: 'classified', ...base, classified });
+    const id = await this.#send({ kind: 'classified', ...base, classified });
+    this.#log({ event: 'SENT_CLASSIFIED', msgId: id, label: labelText, detail: `to ${to}` });
+    return id;
   }
 
   #base(to: string) {
     return { v: 1 as const, msgId: randomId(), from: this.userId, to, sentAt: this.#now() };
   }
 
-  #send(inner: InnerUnsigned): string {
-    if (!this.#enrollment) throw new Error('client not enrolled');
+  async #send(inner: Inner): Promise<string> {
+    if (!this.#enrollment || !this.#senderCert) throw new Error('client not enrolled');
+    if (this.#senderCert.expiration() <= this.#now()) throw new Error('sender certificate expired; fetch a new one from the authority');
     const peer = this.#peerEnrollment(inner.to);
-    const signed = { ...inner, sig: signData(this.#identity.privateKey, canonical(inner)) } as Inner;
-    this.#relay.deliver(sealTransport(signed, peer.transportPub));
+    const sealed = await this.#signal.encrypt(
+      peer.aci,
+      canonical(inner),
+      this.#senderCert,
+      () => this.#relay.takePreKeys(inner.to),
+      this.#now(),
+    );
+    this.#relay.deliver({ v: 1, id: inner.msgId, to: inner.to, sealed });
     return inner.msgId;
   }
 
   // ----------------------------------------------------------- Receiving
 
   /** Fetch new messages. Invalid ones are dropped and logged. */
-  sync(): ReceivedMessage[] {
+  async sync(): Promise<ReceivedMessage[]> {
     const out: ReceivedMessage[] = [];
     for (const env of this.#relay.fetch(this.userId)) {
       let inner: Inner;
       try {
-        inner = openTransport(env, this.#transport.privateKey, this.transportPub);
-        this.#checkInner(inner, env.id);
+        const { senderAci, plaintext } = await this.#signal.decrypt(env.sealed, this.#trustRoot, this.#now());
+        inner = JSON.parse(plaintext.toString('utf8')) as Inner;
+        this.#checkInner(inner, env.id, senderAci);
       } catch (err) {
-        this.#log('REJECTED_MESSAGE', env.id, undefined, (err as Error).message);
+        this.#log({ event: 'REJECTED_MESSAGE', msgId: env.id, detail: (err as Error).message });
         continue;
       }
       if (this.#seen.has(inner.msgId)) continue; // replay
@@ -183,18 +218,18 @@ export class Client {
         out.push({ kind: 'plain', msgId: inner.msgId, from: inner.from, sentAt: inner.sentAt, body: inner.body });
       } else {
         const h = inner.classified.header;
-        this.#log('RECEIVED_CLASSIFIED', h.msgId, formatLabel(h), `from ${h.from}`);
+        this.#log({ event: 'RECEIVED_CLASSIFIED', msgId: h.msgId, label: formatLabel(h), detail: `from ${h.from}` });
         out.push({ kind: 'classified', msgId: h.msgId, from: h.from, sentAt: inner.sentAt, label: formatLabel(h), policy: h.policy });
       }
     }
     return out;
   }
 
-  #checkInner(inner: Inner, envelopeId: string): void {
+  /** libsignal has proved which account sent it; check that matches who the message claims to be from. */
+  #checkInner(inner: Inner, envelopeId: string, senderAci: string): void {
     if (inner.to !== this.userId || inner.msgId !== envelopeId) throw new Error('envelope/addressing mismatch');
     const sender = this.#peerEnrollment(inner.from);
-    const { sig, ...unsigned } = inner;
-    if (!verifyData(sender.identityPub, canonical(unsigned), sig)) throw new Error(`bad signature claiming to be from ${inner.from}`);
+    if (sender.aci !== senderAci) throw new Error(`sender mismatch: message claims to be from ${inner.from}`);
     if (inner.kind === 'classified') {
       const h = inner.classified.header;
       if (h.from !== inner.from || h.to !== this.userId || h.msgId !== inner.msgId) throw new Error('classified header mismatch');
@@ -213,7 +248,7 @@ export class Client {
     const label = formatLabel(h);
 
     if (h.policy.expiresAt !== undefined && now > h.policy.expiresAt) {
-      this.#erase(msgId);
+      this.#inbox.delete(msgId);
       this.#deny(msgId, label, 'message expired');
     }
 
@@ -239,9 +274,9 @@ export class Client {
       this.#deny(msgId, label, `decryption failed: ${(err as Error).message}`);
     }
 
-    this.#log('OPENED', msgId, label, `on ${this.device.deviceId}`);
+    this.#log({ event: 'OPENED', msgId, label, detail: `on ${this.device.deviceId}` });
     if (h.policy.viewOnce) {
-      this.#erase(msgId);
+      this.#inbox.delete(msgId);
       this.#consumed.add(msgId);
     }
     return {
@@ -259,7 +294,7 @@ export class Client {
    * re-encrypted to the new recipient (so it needs the token and PIN, and the
    * new recipient's clearance must cover the label) unless forwarding is forbidden.
    */
-  forward(msgId: string, to: string, token?: HardwareToken, pin?: string): string {
+  async forward(msgId: string, to: string, token?: HardwareToken, pin?: string): Promise<string> {
     const inner = this.#inbox.get(msgId);
     if (!inner) throw new Error(`no message ${msgId}`);
     if (inner.kind === 'plain') return this.sendText(to, inner.body);
@@ -271,12 +306,24 @@ export class Client {
     return this.sendClassified(to, view.text, { level: h.level, compartments: h.compartments, ...h.policy });
   }
 
-  /** Locally readable (encrypted) messages; used to show view-once erasure. */
+  /** Whether the (still encrypted) message is held locally; used to show erasure. */
   hasMessage(msgId: string): boolean {
     return this.#inbox.has(msgId);
   }
 
   // ------------------------------------------------------------- Helpers
+
+  /** The identity key the authority certified for a Signal account, if still valid. */
+  #certifiedIdentity(aci: string): PublicKey | undefined {
+    const b = this.#relay.findByAci(aci);
+    if (!b) return undefined;
+    try {
+      const e = verifyCert(this.#trust, b.enrollment, 'enrollment', this.#now());
+      return e.aci === aci ? decodePublicKey(e.signalIdentityKey) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   #ownClearance(): ClearanceCert {
     if (!this.#clearance) throw new AccessDenied('you hold no clearance');
@@ -304,16 +351,12 @@ export class Client {
     return c;
   }
 
-  #erase(msgId: string): void {
-    this.#inbox.delete(msgId);
+  #log(r: Omit<AuditRecord, 'ts' | 'actor'>): void {
+    this.#audit.append({ ts: this.#now(), actor: this.userId, ...r });
   }
 
-  #log(event: Parameters<AuditLog['append']>[0]['event'], msgId?: string, label?: string, detail?: string): void {
-    this.#audit.append({ ts: this.#now(), actor: this.userId, event, msgId, label, detail });
-  }
-
-  #deny(msgId: string, label: string | undefined, reason: string): never {
-    this.#log('DENIED', msgId, label, reason);
+  #deny(msgId: string | undefined, label: string | undefined, reason: string): never {
+    this.#log({ event: 'DENIED', msgId, label, detail: reason });
     throw new AccessDenied(reason);
   }
 }

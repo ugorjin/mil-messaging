@@ -12,7 +12,10 @@ clearance check.
 
 ## Run it
 
-Needs Node 22.18 or newer (it runs the TypeScript directly). No runtime dependencies.
+Needs Node 22.18 or newer (it runs the TypeScript directly). The one runtime
+dependency is [libsignal](https://github.com/signalapp/libsignal)
+(`@signalapp/libsignal-client`), which ships prebuilt native binaries for
+Linux, macOS and Windows (x64 and arm64).
 
 ```bash
 npm install
@@ -33,29 +36,34 @@ npm run typecheck
 ## How it works
 
 ```
-                    ┌──────────── Layer 1: transport (every message) ─────────────┐
-                    │  ECIES to recipient's transport key · sender hidden inside  │
-                    │  signed with sender's identity key (Ed25519)                │
-                    │   ┌──────── Layer 2: classified envelope ──────────────┐    │
-                    │   │ header (authenticated, not secret):                │    │
-                    │   │   from · to · SECRET//OPS · noForward · viewOnce   │    │
-                    │   │   expiresAt · recipient clearance cert serial      │    │
-                    │   │ content: AES-256-GCM with a random message key     │    │
-                    │   │ message key: encrypted to recipient's CLEARANCE    │    │
-                    │   │   key, which only exists on their hardware token   │    │
-                    │   └────────────────────────────────────────────────────┘    │
-                    └─────────────────────────────────────────────────────────────┘
+  ┌─ Layer 1: Signal protocol (libsignal) ─ every message ──────────────────────┐
+  │  session start: PQXDH (X25519 + Kyber/ML-KEM pre-keys)                      │
+  │  messages: Double Ratchet (forward secrecy, post-compromise security)       │
+  │  sealed sender: relay sees only the recipient; sender proved inside by a    │
+  │    short-lived SenderCertificate from the organisation's Authority          │
+  │  identity keys trusted only if they match the Authority's enrollment cert   │
+  │                                                                             │
+  │   ┌─ Layer 2: classified envelope ─ classified messages only ────────────┐  │
+  │   │ header (authenticated, not secret):                                  │  │
+  │   │   from · to · SECRET//OPS · noForward · viewOnce · expiresAt         │  │
+  │   │   recipient clearance cert serial                                    │  │
+  │   │ content: AES-256-GCM with a random message key                       │  │
+  │   │ message key: encrypted to the recipient's CLEARANCE key, which       │  │
+  │   │   only exists on their hardware token                                │  │
+  │   └──────────────────────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Part | File | What it does |
 |---|---|---|
 | Primitives | `src/crypto.ts` | X25519, Ed25519, HKDF-SHA256, AES-256-GCM, canonical JSON |
 | Labels | `src/classification.ts` | Levels + compartments; "dominates" check (no read up) |
-| Clearance Authority | `src/authority.ts` | Organisation PKI: signs enrollment and clearance certificates, revocation |
+| Clearance Authority | `src/authority.ts` | Organisation PKI: signs enrollment and clearance certificates, revocation; sealed-sender trust root |
 | Hardware token | `src/token.ts` | Holds the clearance private key; PIN with lockout and key erasure |
 | Device posture | `src/device.ts` | MDM enrolled, not rooted, recent OS patches, screen capture blocked |
-| Layers 1 and 2 | `src/layers.ts` | The two encryption layers |
-| Relay server | `src/relay.ts` | Stores key bundles and opaque envelopes; cannot read anything |
+| Layer 1 | `src/layer1.ts` | libsignal: key stores, pre-keys, PQXDH session start, sealed-sender encrypt/decrypt |
+| Layer 2 | `src/layer2.ts` | Classified envelope bound to its label and handling rules |
+| Relay server | `src/relay.ts` | Stores certificates, pre-keys (hands out each one-time pre-key once) and opaque envelopes |
 | Client | `src/client.ts` | Send / receive / open / forward, with every check enforced |
 | Audit log | `src/audit.ts` | Hash-chained log of events; never stores content |
 
@@ -79,22 +87,31 @@ rules). Opening checks, in order:
 Every refusal and every successful open is written to the audit log. The text
 is returned with a watermark naming the reader, device and time.
 
-### What the tests cover (`test/messaging.test.ts`)
-The relay sees no sender, text or label · clearance too low, missing
-compartment, and sending above your own level are all refused · wrong PIN, PIN
-lockout with key erasure, and another user's token are refused · header
-tampering (downgrade) fails · forged signatures are rejected · revoked and
-expired clearances are refused · message expiry and view-once erase the message
-· forwarding is blocked, or re-encrypted to a cleared recipient when allowed ·
-rooted or unmanaged devices are refused · replays are ignored · the audit chain
-detects edits and deletions.
+### What the tests cover (`test/messaging.test.ts`, 24 tests)
+**Layer 1:** messages round-trip, and a two-way conversation keeps working as
+the ratchet advances · each one-time pre-key is used once · the relay sees no
+sender, account ID, text or label · a server swapping in its own identity key
+is refused · sender certificates not from the organisation are rejected · a
+user can't use another user's sender certificate · replays are rejected by the
+ratchet · revoked enrollment stops new sender certificates and messages · an
+expired sender certificate can't be used.
+
+**Layer 2:** clearance too low, missing compartment, and sending above your own
+level are refused (and audited) · wrong PIN, PIN lockout with key erasure, and
+another user's token are refused · header tampering (downgrade) fails · revoked
+and expired clearances are refused · message expiry and view-once erase the
+message · forwarding is blocked, or re-encrypted to a cleared recipient when
+allowed · rooted or unmanaged devices are refused · the audit chain detects
+edits and deletions.
 
 ## Production gaps
 
 | Prototype | Production |
 |---|---|
-| Layer 1 is one ephemeral key per message (only the sender side has forward secrecy) | Signal Double Ratchet (libsignal) for 1:1 chats, MLS (OpenMLS) for groups, with hybrid post-quantum (X25519 + ML-KEM) |
-| Classical crypto only | Hybrid post-quantum key exchange for both layers; ML-DSA signatures |
+| 1:1 chats only | Groups via MLS (OpenMLS) or Signal sender keys, with the same clearance check per member |
+| Pre-keys generated once, kept in memory | Encrypted on-device stores; replenish one-time pre-keys, rotate signed and Kyber pre-keys on a schedule |
+| Sender certificates refreshed manually | The app fetches a new one daily from an authenticated endpoint |
+| Layer 2 and the Authority's signatures are classical (X25519, Ed25519) | Hybrid post-quantum wrapping (add ML-KEM) and ML-DSA signatures |
 | Token is a JS object | Smart card / CAC / YubiKey PIV, Secure Enclave / StrongBox, with touch or biometric |
 | Device state is self-reported | Hardware attestation (App Attest, Play Integrity, Key Attestation) checked by the server, plus MDM |
 | Revocation is an in-memory set | Signed revocation lists / OCSP from an HSM-backed CA, short-lived certificates |
@@ -106,3 +123,24 @@ detects edits and deletions.
 Limits no design removes: a compromised device can read what its user reads; a
 second camera can photograph the screen (the watermark only traces the leak);
 cleared insiders can still leak.
+
+## Licence note
+
+libsignal is licensed **AGPL-3.0**. If you distribute an app built on it, or let
+users interact with it over a network, you must make your source code available
+under the AGPL. That is usually fine for a government or in-house system, but
+check with counsel before any commercial or closed-source use.
+
+## Hosting
+
+Only the **relay server** and the **Authority** need hosting. Encryption and
+decryption happen on the devices. libsignal is a native library, so clients are
+native apps: iOS (Swift), Android (Java/Kotlin) or desktop (Electron/Node).
+There is no supported browser build, so a plain web app can't be a client.
+
+| Option | Good for | Notes |
+|---|---|---|
+| **Vercel** | Marketing site, docs, an admin UI | Poor fit for the relay: serverless functions don't keep WebSocket connections open or keep state between requests, and you'd need a separate database and queue anyway. Not suitable for anything with classified handling requirements. |
+| Fly.io / Railway / Render / a VPS with Docker | Development and pilots | One long-running Node process with WebSockets plus Postgres (bundles, queues) and Redis (presence). The simplest real deployment of this relay. |
+| AWS GovCloud / Azure Government (and their high-impact authorised regions) | Government use of non-classified sensitive data | Needs the matching compliance authorisation for your data category. |
+| On-premises or air-gapped servers, or the government's own classified networks | Real classified traffic | Required for classified data in practice; the Authority's keys go in an HSM. |
