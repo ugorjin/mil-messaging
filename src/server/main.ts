@@ -8,8 +8,10 @@
  *   HOST                   default 0.0.0.0
  *   MAX_ENVELOPE_BYTES     default 262144
  *   MESSAGE_RETENTION_DAYS undelivered messages are deleted after this, default 30
- *   RATE_LIMIT_PER_MINUTE  per user / IP, default 600
+ *   RATE_LIMIT_PER_MINUTE  per authenticated user, default 600
+ *   IP_RATE_LIMIT_PER_MINUTE per client IP, default RATE_LIMIT_PER_MINUTE
  *   TRUST_PROXY            "true" to use X-Forwarded-For (only behind your own proxy)
+ *   CLIENT_IP_HEADER       header with the real client IP set by your proxy (Fly.io: fly-client-ip)
  *
  * TLS is expected to be terminated in front of this process (a load balancer or
  * reverse proxy). Never expose it over plain HTTP outside a private network.
@@ -50,7 +52,9 @@ const app = createRelayApp({
   authorityPublicKey,
   maxEnvelopeBytes: env.MAX_ENVELOPE_BYTES ? Number(env.MAX_ENVELOPE_BYTES) : undefined,
   rateLimitPerMinute: env.RATE_LIMIT_PER_MINUTE ? Number(env.RATE_LIMIT_PER_MINUTE) : undefined,
+  ipRateLimitPerMinute: env.IP_RATE_LIMIT_PER_MINUTE ? Number(env.IP_RATE_LIMIT_PER_MINUTE) : undefined,
   trustProxy: env.TRUST_PROXY === 'true',
+  clientIpHeader: env.CLIENT_IP_HEADER || undefined,
   log,
 });
 

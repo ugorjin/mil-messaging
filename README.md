@@ -160,6 +160,47 @@ Without Compose, the image runs anywhere that runs containers (Fly.io,
 Railway, Render, a VPS, Kubernetes). It needs `AUTHORITY_PUBLIC_KEY` and
 `DATABASE_URL`; all settings are listed at the top of `src/server/main.ts`.
 
+### Deploy to Fly.io
+
+`fly.toml` runs the relay as **one always-on machine** (push notifications and
+rate limits live in process memory, so a second machine would miss
+notifications). Fly terminates HTTPS, and the server reads the real client IP
+from the `Fly-Client-IP` header. You need [flyctl](https://fly.io/docs/flyctl/)
+and a Fly account. The app and the database are billed to that account.
+
+1. Choose a unique app name and a region, and put them in `fly.toml`
+   (`app`, `primary_region`). Then create the app:
+   ```bash
+   fly apps create <your-app-name>
+   ```
+2. Create a Postgres database in the same region and give the app its
+   connection string as the `DATABASE_URL` secret. Fly Managed Postgres is the
+   natural choice; check
+   [Fly's Postgres docs](https://fly.io/docs/mpg/) for the current commands
+   and plans. Any Postgres 14+ reachable from Fly works.
+3. Set the Authority's public key (from `npm run authority -- public`):
+   ```bash
+   fly secrets set AUTHORITY_PUBLIC_KEY=<key>
+   ```
+4. Deploy. `--ha=false` keeps it to one machine.
+   ```bash
+   fly deploy --ha=false
+   ```
+5. Check it:
+   ```bash
+   curl https://<your-app-name>.fly.dev/healthz
+   ```
+   ```bash
+   RELAY_URL=https://<your-app-name>.fly.dev npm run net-demo
+   ```
+
+**Later deploys from GitHub:** create a deploy token with
+`fly tokens create deploy`, save it as the repository secret `FLY_API_TOKEN`,
+then run the **Deploy to Fly.io** workflow from the Actions tab. It runs the
+tests first, deploys, and checks `/healthz`. It never runs on its own.
+
+The Authority's secrets file never goes to Fly: only its public key does.
+
 ### API
 
 | Method and path | Auth | Purpose |
@@ -187,8 +228,9 @@ Railway, Render, a VPS, Kubernetes). It needs `AUTHORITY_PUBLIC_KEY` and
   `MESSAGE_RETENTION_DAYS` (default 30).
 - **Logs:** method, route, status and timing only. No user IDs, message IDs
   or IPs, because who-talks-to-whom is sensitive too.
-- **Limits:** request body and envelope size limits, per-user / per-IP rate
-  limiting, request timeouts.
+- **Limits:** request body and envelope size limits, request timeouts, and
+  rate limits per client IP (every request) and per user (only after the
+  signature checks out, so nobody can use up someone else's allowance).
 - **Container:** non-root user, read-only filesystem, all Linux capabilities
   dropped, `no-new-privileges`. The database is on an internal network with no
   outside route, and only the relay can reach it.
@@ -236,6 +278,6 @@ There is no supported browser build, so a plain web app can't be a client.
 | Option | Good for | Notes |
 |---|---|---|
 | **Vercel** | Marketing site, docs, an admin UI | Poor fit for the relay: serverless functions don't keep WebSocket connections open or keep state between requests, and you'd need a separate database and queue anyway. Not suitable for anything with classified handling requirements. |
-| Fly.io / Railway / Render / a VPS with Docker | Development and pilots | Run the Docker image from this repo plus a managed Postgres. The simplest real deployment. |
+| Fly.io / Railway / Render / a VPS with Docker | Development and pilots | Run the Docker image from this repo plus a managed Postgres. Fly.io config is included (`fly.toml`). |
 | AWS GovCloud / Azure Government (and their high-impact authorised regions) | Government use of non-classified sensitive data | Needs the matching compliance authorisation for your data category. |
 | On-premises or air-gapped servers, or the government's own classified networks | Real classified traffic | Required for classified data in practice; the Authority's keys go in an HSM. |

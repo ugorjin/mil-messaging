@@ -1,0 +1,37 @@
+# Deploy the relay to Fly.io. Runs only when started by hand
+# (Actions tab → "Deploy to Fly.io" → Run workflow), after the tests pass.
+#
+# One-time setup: create a deploy token (fly tokens create deploy) and save it
+# as the repository secret FLY_API_TOKEN.
+name: Deploy to Fly.io
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # --ha=false: keep a single machine (see fly.toml).
+      - run: flyctl deploy --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Health check
+        run: |
+          app=$(sed -n 's/^app = "\(.*\)"/\1/p' fly.toml)
+          for i in $(seq 1 30); do curl -fsS "https://$app.fly.dev/healthz" && exit 0; sleep 5; done
+          exit 1

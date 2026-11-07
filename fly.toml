@@ -1,0 +1,41 @@
+# Fly.io config for the relay server. See README "Deploy to Fly.io".
+#
+# Change `app` to a name of your own (it must be unique across Fly) and
+# `primary_region` to the region nearest your users (run: fly platform regions).
+app = "mil-messaging-relay"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # Fly's proxy sets this to the real client IP; used for per-IP rate limits.
+  CLIENT_IP_HEADER = "fly-client-ip"
+  MESSAGE_RETENTION_DAYS = "30"
+  # Set as secrets, not here: AUTHORITY_PUBLIC_KEY, DATABASE_URL
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Exactly one machine, always on. WebSocket push and rate limits live in
+  # process memory, so a second machine would miss notifications.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 800
+    hard_limit = 1000
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

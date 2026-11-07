@@ -36,10 +36,17 @@ export interface RelayAppOptions {
   now?: () => number;
   /** Largest sealed message accepted, in bytes. */
   maxEnvelopeBytes?: number;
-  /** Requests per user (or per IP when not signed in), per minute. */
+  /** Requests per authenticated user, per minute. */
   rateLimitPerMinute?: number;
+  /** Requests per client IP, per minute (default: same as rateLimitPerMinute). */
+  ipRateLimitPerMinute?: number;
   /** Trust X-Forwarded-For for the client IP (only behind your own proxy). */
   trustProxy?: boolean;
+  /**
+   * Header your proxy sets to the real client IP and that clients can't forge,
+   * e.g. "fly-client-ip" on Fly.io. Takes precedence over trustProxy.
+   */
+  clientIpHeader?: string;
   log?: (entry: Record<string, unknown>) => void;
 }
 
@@ -66,7 +73,8 @@ export function createRelayApp(o: RelayAppOptions): RelayApp {
   const now = o.now ?? Date.now;
   const maxEnvelopeBytes = o.maxEnvelopeBytes ?? 256 * 1024;
   const maxBodyBytes = Math.ceil(maxEnvelopeBytes * 1.4) + 64 * 1024; // base64 overhead + JSON
-  const rateLimit = o.rateLimitPerMinute ?? 600;
+  const userLimit = o.rateLimitPerMinute ?? 600;
+  const ipLimit = o.ipRateLimitPerMinute ?? userLimit;
   const log = o.log ?? ((e) => console.log(JSON.stringify(e)));
   const store = o.store;
 
@@ -76,17 +84,33 @@ export function createRelayApp(o: RelayAppOptions): RelayApp {
   // ----------------------------------------------------------- Helpers
 
   const buckets = new Map<string, { tokens: number; at: number }>();
-  function rateLimitHit(key: string): void {
+  /**
+   * Token bucket. Keys are "ip:..." (checked on every request) and "user:..."
+   * (checked only after the signature is verified, so nobody can spend another
+   * user's allowance or dodge the limit by inventing user names).
+   */
+  function rateLimitHit(key: string, limit: number): void {
     const t = now();
-    const b = buckets.get(key) ?? { tokens: rateLimit, at: t };
-    b.tokens = Math.min(rateLimit, b.tokens + ((t - b.at) / 60_000) * rateLimit);
+    const b = buckets.get(key) ?? { tokens: limit, at: t };
+    b.tokens = Math.min(limit, b.tokens + ((t - b.at) / 60_000) * limit);
     b.at = t;
     if (b.tokens < 1) throw new HttpError(429, 'rate limit exceeded');
     b.tokens -= 1;
     buckets.set(key, b);
   }
 
+  const bucketSweep = setInterval(() => {
+    const cutoff = now() - 120_000;
+    for (const [k, b] of buckets) if (b.at < cutoff) buckets.delete(k);
+  }, 60_000);
+  bucketSweep.unref();
+
   function clientIp(req: IncomingMessage): string {
+    if (o.clientIpHeader) {
+      const v = req.headers[o.clientIpHeader.toLowerCase()];
+      const ip = (Array.isArray(v) ? v[0] : v)?.trim();
+      if (ip) return ip;
+    }
     const fwd = o.trustProxy ? String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim() : '';
     return fwd || req.socket.remoteAddress || 'unknown';
   }
@@ -157,6 +181,7 @@ export function createRelayApp(o: RelayAppOptions): RelayApp {
     }
     if (!ok) throw new HttpError(401, 'bad request signature');
     if (!(await store.useNonce(nonce, Number(ts) + MAX_CLOCK_SKEW_MS, now()))) throw new HttpError(401, 'replayed request');
+    rateLimitHit(`user:${e.userId}`, userLimit);
     return e;
   }
 
@@ -307,7 +332,7 @@ export function createRelayApp(o: RelayAppOptions): RelayApp {
     let route = 'unmatched';
     let payload: unknown;
     try {
-      rateLimitHit(header(req, AUTH.user) ?? `ip:${clientIp(req)}`);
+      rateLimitHit(`ip:${clientIp(req)}`, ipLimit);
       const match = routes.find(([m, re]) => m === req.method && re.test(url.pathname));
       if (!match) throw new HttpError(404, 'not found');
       route = `${match[0]} ${match[1].source}`;
@@ -367,6 +392,7 @@ export function createRelayApp(o: RelayAppOptions): RelayApp {
     server,
     async close() {
       clearInterval(heartbeat);
+      clearInterval(bucketSweep);
       for (const set of sockets.values()) for (const s of set) s.ws.terminate();
       wss.close();
       server.closeAllConnections();

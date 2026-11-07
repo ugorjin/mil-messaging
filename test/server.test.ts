@@ -251,3 +251,40 @@ test('HttpRelay refuses plain http to a remote host', () => {
   assert.throws(() => new HttpRelay('http://relay.example.com'), /https/);
   new HttpRelay('https://relay.example.com');
 });
+
+describe('rate limiting by IP and by verified user', () => {
+  const authority = new Authority();
+  const start = async (opts: { rateLimitPerMinute: number; ipRateLimitPerMinute: number; clientIpHeader?: string }) => {
+    const app = createRelayApp({ store: new MemoryStore(), authorityPublicKey: authority.publicKey, log: () => {}, ...opts });
+    await new Promise<void>((r) => app.server.listen(0, '127.0.0.1', () => r()));
+    return { app, base: `http://127.0.0.1:${(app.server.address() as AddressInfo).port}` };
+  };
+
+  test('inventing user names does not get around the IP limit', async () => {
+    const { app, base } = await start({ rateLimitPerMinute: 100, ipRateLimitPerMinute: 3 });
+    const codes = [];
+    for (let i = 0; i < 5; i++) codes.push((await fetch(`${base}/v1/messages`, { headers: { 'x-mm-user': `fake-${i}` } })).status);
+    assert.deepEqual(codes, [401, 401, 401, 429, 429]);
+    await app.close();
+  });
+
+  test("an attacker claiming a user's name does not use up that user's allowance", async () => {
+    const { app, base } = await start({ rateLimitPerMinute: 3, ipRateLimitPerMinute: 1000 });
+    const relay = new TestRelay(base);
+    const bob = await enroll(authority, { userId: 'bob', relay, trust: authority, audit: authority.audit, device: goodDevice('p', Date.now()), pin: PIN });
+    for (let i = 0; i < 10; i++) await fetch(`${base}/v1/messages`, { headers: { 'x-mm-user': 'bob' } }); // unsigned spam
+    assert.equal((await relay.fetch('bob')).length, 0, 'bob still gets through');
+    await relay.fetch('bob');
+    await assert.rejects(relay.fetch('bob'), /relay 429/, 'his own requests are limited');
+    void bob;
+    await app.close();
+  });
+
+  test('uses the configured client IP header (e.g. fly-client-ip)', async () => {
+    const { app, base } = await start({ rateLimitPerMinute: 100, ipRateLimitPerMinute: 2, clientIpHeader: 'fly-client-ip' });
+    const hit = (ip: string) => fetch(`${base}/healthz`, { headers: { 'fly-client-ip': ip } }).then((r) => r.status);
+    assert.deepEqual([await hit('1.1.1.1'), await hit('1.1.1.1'), await hit('1.1.1.1')], [200, 200, 429]);
+    assert.equal(await hit('2.2.2.2'), 200, 'a different client has its own allowance');
+    await app.close();
+  });
+});
